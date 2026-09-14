@@ -1,0 +1,91 @@
+1) obtain structured time-space-champ-vision-death data / 
+
+2) train a model on it
+
+3) hook up a CV system to league to produce the same data as training quickly
+
+4) Predict in real time
+
+5) Overlay transparent window
+
+______________________________________________
+
+No concept of respawn timer... dont care for now! LETS GET TO TRAININGGG
+
+input : [(posX,posY,confidence),...] x10 (Over the previous 10 frames)
+        # Blue top, Blue Jungle... Red Support
+
+Output: 
+Bivariate Gaussian (Continuous & Lightweight)
+Instead of predicting a discrete grid, you force the network to output the parameters of a 2D bell curve (a Gaussian distribution).
+
+JUST 10 FRAMES PROBABLY AINT GETTING YOU VERY FAR!
+
+STUDY THE ARCHITECTURE! Why dropout? Why norm1,2 ? 
+
+
+FogOfWarTransformer(
+  (input_proj): Linear(in_features=30, out_features=128, bias=True)
+  (transformer): TransformerEncoder(
+    (layers): ModuleList(
+      (0-2): 3 x TransformerEncoderLayer(
+        (self_attn): MultiheadAttention(
+          (out_proj): NonDynamicallyQuantizableLinear(in_features=128, out_features=128, bias=True)
+        )
+        (linear1): Linear(in_features=128, out_features=512, bias=True)
+        (dropout): Dropout(p=0.1, inplace=False)
+        (linear2): Linear(in_features=512, out_features=128, bias=True)
+        (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (dropout1): Dropout(p=0.1, inplace=False)
+        (dropout2): Dropout(p=0.1, inplace=False)
+      )
+    )
+  )
+  (output_head): Linear(in_features=128, out_features=50, bias=True)
+)
+
+Total learnable parameters: 606,514
+
+# Champs to avoid
+
+Shyvana
+Fiddle
+Xin Zhao
+Mel 
+Locke
+Neeko 
+
+#====================Start Jupyter MCP Server
+jupyter trust "YOLO Model.ipynb"
+
+#Launch from \LeagueMapPredictor
+
+jupyter lab --port 8888 --ip 0.0.0.0 --ServerApp.allow_remote_access=True --ServerApp.allow_origin='*'
+
+
+# start venv
+.venv\Scripts\Activate.ps1
+
+#======================
+
+ITS  CAPABLE OF OVERFITTING! Lets get to big data collection and big training!
+
+to download weights from modal just go to the browser dashboard - storage 
+
+______________________________________________
+13/9
+it can successfully learn to copy positions, and express uncertainty when enemy out of vision. However, it 
+predicts a mean position always. Maybe we should penalise it more for just expressing uncertainty. 
+also this one has some team identification mistakes: SG2-171944813
+
+next step: dont predict blue side, penalize mean guesses, make model bigger? give more than 60 frames? 
+
+______________________________________________
+14/9 - Architecture & Loss Overhaul:
+1. Red-Only Target Supervision: Output head predicts (B, 5, 5) exclusively for the 5 Red enemy roles.
+   Stops wasting 50% of gradients on trivial Blue identity copying.
+2. FoW Importance Weighting: Multiplies loss by 3x on frames where enemy was hidden in FoW (conf==0 at t=59).
+3. Auxiliary L1 Coordinate Penalty: Added direct L1 distance penalty on mu (weight 5.0) to prevent
+   the model from cheating by placing mu in the center with huge sigma.
+4. Visualizer: Plots Blue team known positions from t=59, and renders 2-sigma ellipses + ground truth error lines for Red team.

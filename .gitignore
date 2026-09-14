@@ -1,0 +1,31 @@
+# Virtual environments
+.venv/
+venv/
+
+# Environment variables & secrets
+.env
+**/.env
+*.env
+
+# Large datasets & weights
+*.csv
+*.png
+*.jpg
+*.mp4
+*.pt
+*.onnx
+Dataset/
+Dataset/*
+models/
+models/*
+pyLoL/models/
+pyLoL/models/*
+
+# Cache & checkpoints
+__pycache__/
+.ipynb_checkpoints/
+Dataset_cleaned.zip
+*.zip
+.jupyter/
+*.db
+.specstory/
