@@ -89,3 +89,25 @@ ______________________________________________
 3. Auxiliary L1 Coordinate Penalty: Added direct L1 distance penalty on mu (weight 5.0) to prevent
    the model from cheating by placing mu in the center with huge sigma.
 4. Visualizer: Plots Blue team known positions from t=59, and renders 2-sigma ellipses + ground truth error lines for Red team.
+
+Faulty data: 
+SG2-172015027 (Indetectable Zaahen) [Removed]
+SG2-171944813 (Wrong assignment of roles) [Removed]
+
+______________________________________________
+9/15 
+
+put it to rest for now.. i think we need to feed more data, and the cv part, should be\
+incorporated as part of the whole model. (Data: Death, gold, game time, objectives) 
+
+______________________________________________
+10/9 
+
+Obtain death timer data at least to incorporate into info 
+Make big model on modal
+Just track jungler first 
+
+
+
+
+

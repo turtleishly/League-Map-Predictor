@@ -1,6 +1,7 @@
 # Launch with: modal run modal_train.py
 import secrets
 from pathlib import Path
+# pyrefly: ignore [missing-import]
 import modal
 
 # 1. Define paths

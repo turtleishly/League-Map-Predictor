@@ -9,12 +9,65 @@ import re
 import ctypes
 from ctypes import wintypes
 from pathlib import Path
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 import pydirectinput
 import mss
 import mss.tools
 from requests.auth import HTTPBasicAuth
 from tqdm import tqdm
+
+
+class InGamePlayerPoller(Thread):
+    """
+    Lightweight background poller for the in-game Live Client API (port 2999).
+    Polls /liveclientdata/playerlist asynchronously so it never slows down
+    or drops frames in the 10x replay screenshot loop.
+    """
+    def __init__(self, stop_event, poll_interval=0.04):
+        super().__init__(daemon=True)
+        self.stop_event = stop_event
+        self.poll_interval = poll_interval
+        self.latest_data = {}
+        self.lock = Lock()
+
+    def run(self):
+        requests.packages.urllib3.disable_warnings()
+        url = "https://127.0.0.1:2999/liveclientdata/playerlist"
+        while not self.stop_event.is_set():
+            try:
+                res = requests.get(url, verify=False, timeout=0.25)
+                if res.status_code == 200:
+                    data = res.json()
+                    parsed = {}
+                    for p in data:
+                        if not isinstance(p, dict):
+                            continue
+                        cname = p.get("championName", "")
+                        if not cname:
+                            continue
+                        scores = p.get("scores", {})
+                        parsed[cname] = {
+                            "is_dead": bool(p.get("isDead", False)),
+                            "respawn_timer": round(float(p.get("respawnTimer", 0.0)), 1),
+                            "kills": int(scores.get("kills", 0)),
+                            "deaths": int(scores.get("deaths", 0)),
+                            "assists": int(scores.get("assists", 0)),
+                            "creep_score": int(scores.get("creepScore", 0)),
+                            "level": int(p.get("level", 1)),
+                            "team": str(p.get("team", "")),
+                            "position": str(p.get("position", "")),
+                            "items": [int(item.get("itemID", 0)) for item in p.get("items", []) if isinstance(item, dict) and item.get("itemID")]
+                        }
+                    if parsed:
+                        with self.lock:
+                            self.latest_data = parsed
+            except Exception:
+                pass
+            time.sleep(self.poll_interval)
+
+    def get_latest(self):
+        with self.lock:
+            return self.latest_data.copy()
 
 TEAM_HOTKEY_DICT = {'Red': 'f2', 'Blue': 'f1', 'All': 'f3'}
 
@@ -140,6 +193,40 @@ class ReplayScraper(object):
         except Exception:
             pass
         return []
+
+    def get_match_roles_api(self, match_id, api_key, routing_region="sea", save_to_match_dir=True):
+        """
+        Fetches the 10 champion official roles using the Riot Match-V5 API.
+        Optionally saves to Dataset/{match_id}/roles.json.
+        Returns dict: {champion_name: 'Blue_Top', ...}
+        """
+        clean_id = str(match_id).replace("-", "_")
+        url = f"https://{routing_region}.api.riotgames.com/lol/match/v5/matches/{clean_id}?api_key={api_key}"
+        pos_map = {"TOP": "Top", "JUNGLE": "Jungle", "MIDDLE": "Mid", "BOTTOM": "Bot", "UTILITY": "Support"}
+        try:
+            res = requests.get(url, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                participants = data.get("info", {}).get("participants", [])
+                roles = {}
+                for p in participants:
+                    champ = p.get("championName", "")
+                    team_prefix = "Blue" if p.get("teamId") == 100 else "Red"
+                    pos_suffix = pos_map.get(str(p.get("teamPosition", "")).upper(), "Mid")
+                    if champ:
+                        roles[champ] = f"{team_prefix}_{pos_suffix}"
+                if len(roles) == 10:
+                    if save_to_match_dir:
+                        save_name = str(match_id).replace(".rofl", "")
+                        target_dir = os.path.join(self.save_dir, save_name)
+                        os.makedirs(target_dir, exist_ok=True)
+                        roles_file = os.path.join(target_dir, "roles.json")
+                        with open(roles_file, "w", encoding="utf-8") as rf:
+                            json.dump(roles, rf, indent=2)
+                    return roles
+        except Exception:
+            pass
+        return {}
 
     @staticmethod
     def get_match_champions_rofl(rofl_path):
@@ -367,6 +454,107 @@ class ReplayScraper(object):
 
         return None
 
+    def clear_replays(self):
+        """
+        Deletes all existing .rofl replay files from the replay directory.
+        Useful when a new League of Legends patch makes older replays unplayable.
+        Returns the count of deleted files.
+        """
+        deleted_count = 0
+        if os.path.exists(self.replay_dir):
+            for fname in os.listdir(self.replay_dir):
+                if fname.endswith(".rofl"):
+                    try:
+                        os.remove(os.path.join(self.replay_dir, fname))
+                        deleted_count += 1
+                    except Exception as e:
+                        print(f"⚠️ Could not delete '{fname}': {e}")
+        return deleted_count
+
+    def fetch_and_download_replays(
+        self,
+        api_key,
+        count=3,
+        tier="PLATINUM",
+        division="I",
+        queue="RANKED_SOLO_5x5",
+        routing_region="sea",
+        banned_champions=None,
+        days_back=5,
+        timeout=60
+    ):
+        """
+        Discovers and downloads `count` fresh .rofl files from Riot API via LCU.
+        Filters out already-scraped matches and matches with banned champions.
+        """
+        banned_champions = banned_champions or self.DEFAULT_BANNED_CHAMPIONS
+        downloaded = []
+        page = 1
+        start_time_epoch = int(time.time()) - (days_back * 24 * 60 * 60)
+
+        print(f"🔍 Searching for {count} fresh replays in {self.region} ({tier} {division})...")
+        while len(downloaded) < count and page <= 5:
+            puuid_url = f"https://{self.region.lower()}.api.riotgames.com/lol/league-exp/v4/entries/{queue}/{tier.upper()}/{division.upper()}?page={page}&api_key={api_key}"
+            try:
+                res = requests.get(puuid_url, timeout=10)
+                if res.status_code == 401:
+                    print("❌ Riot API key is expired (401 Unauthorized)!")
+                    break
+                elif res.status_code != 200:
+                    print(f"⚠️ League API returned status {res.status_code}. Retrying...")
+                    time.sleep(3)
+                    page += 1
+                    continue
+                entries = res.json()
+                if not entries:
+                    break
+                puuids = [e['puuid'] for e in entries if 'puuid' in e]
+            except Exception as e:
+                print(f"⚠️ Error fetching summoners: {e}")
+                break
+
+            for puuid in puuids:
+                if len(downloaded) >= count:
+                    break
+                match_url = f"https://{routing_region}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?queue=420&startTime={start_time_epoch}&count=5&api_key={api_key}"
+                try:
+                    m_res = requests.get(match_url, timeout=10)
+                    if m_res.status_code != 200:
+                        continue
+                    for match_id in m_res.json():
+                        if len(downloaded) >= count:
+                            break
+                        if self.is_match_scraped(match_id):
+                            continue
+                        raw_id = re.split(r'[-_]', match_id)[-1]
+                        if any(raw_id in f for f in os.listdir(self.replay_dir) if f.endswith(".rofl")):
+                            continue
+
+                        # Champion blacklist check
+                        if banned_champions:
+                            champs = self.get_match_champions_api(match_id, api_key, routing_region)
+                            if champs:
+                                is_allowed, banned_found = self.check_banned_champions(champs, banned_champions)
+                                if not is_allowed:
+                                    print(f"🚫 Skipping {match_id}: contains banned champion(s): {banned_found}")
+                                    continue
+
+                        print(f"⬇️ Downloading replay for {match_id}...")
+                        rofl = self.download_replay(match_id, timeout=timeout)
+                        if rofl:
+                            print(f"✅ Downloaded: {os.path.basename(rofl)}")
+                            downloaded.append(match_id)
+                        else:
+                            print(f"⚠️ Could not download {match_id}")
+                        time.sleep(2.0)
+                    time.sleep(1.2)
+                except Exception:
+                    pass
+            page += 1
+
+        print(f"🎉 Successfully downloaded {len(downloaded)}/{count} replays.")
+        return downloaded
+
     # ─────────────────────────────────────────────────────────────
     # In-Game Replay API Configurations
     # ─────────────────────────────────────────────────────────────
@@ -582,6 +770,12 @@ class ReplayScraper(object):
         current_anchor = start_sec
         stalled_resync_count = 0
 
+        # Background player state poller (death status, respawn timer, KDA, items)
+        poller_stop = Event()
+        poller = InGamePlayerPoller(stop_event=poller_stop, poll_interval=0.04)
+        poller.start()
+        frame_player_states = {}
+
         # Query total replay length to avoid waiting past the match conclusion
         replay_length = float(end_sec)
         try:
@@ -663,6 +857,11 @@ class ReplayScraper(object):
                         t.start()
                         active_threads.append(t)
 
+                        # Match player state (death status, timer, KDA, items) to this exact frame
+                        current_pstate = poller.get_latest()
+                        if current_pstate:
+                            frame_player_states[str(game_sec)] = current_pstate
+
                         last_saved_sec = game_sec
                         capture_count += 1
 
@@ -671,9 +870,29 @@ class ReplayScraper(object):
         except Exception as e:
             print(f"\n⚠️ Capture loop exception: {e}")
         finally:
+            poller_stop.set()
+            poller.join(timeout=1.0)
             for t in active_threads:
                 t.join(timeout=0.5)
             self.kill_client()
+
+            # Save frame-synced player states to the match parent folder
+            if frame_player_states:
+                json_path = os.path.join(match_folder, "player_states.json")
+                try:
+                    existing_data = {}
+                    if os.path.exists(json_path):
+                        try:
+                            with open(json_path, "r", encoding="utf-8") as jf:
+                                existing_data = json.load(jf)
+                        except Exception:
+                            existing_data = {}
+                    existing_data.update(frame_player_states)
+                    with open(json_path, "w", encoding="utf-8") as jf:
+                        json.dump(existing_data, jf, indent=2)
+                    print(f"📊 Saved player states ({len(existing_data)} frames) → '{json_path}'")
+                except Exception as e:
+                    print(f"⚠️ Failed to save player states: {e}")
 
         print(f"📸 Captured {capture_count} frames for {game_id} ({team} POV)")
         return capture_count
@@ -716,6 +935,10 @@ class ReplayScraper(object):
                         "game_id": str(game_id),
                         "reason": f"Banned champions: {banned_found}"
                     }
+
+        # Fetch & cache ground-truth roles for Data Cleaning
+        if api_key:
+            self.get_match_roles_api(game_id, api_key=api_key)
 
         results = {}
         for team in teams:
